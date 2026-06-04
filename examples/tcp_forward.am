@@ -1,0 +1,57 @@
+// examples/tcp_forward.am — minimal TCP stream proxy runner.
+//
+// Reads its configuration from the environment so it needs no argv
+// plumbing:
+//
+//   NS_LISTEN=6432 NS_UPSTREAM_HOST=pg.internal NS_UPSTREAM_PORT=5432 \
+//       tcp_forward
+//
+// Forwards a local TCP port to a fixed upstream, splicing raw bytes
+// both ways. Used by tests/run_tests.sh to prove binary-safety (a
+// payload full of NUL bytes round-trips byte-for-byte) and basic
+// forwarding. Ctrl-C (SIGINT) / SIGTERM shuts it down gracefully.
+
+namespace Example
+
+import Amalgame.Net.Stream
+
+public class Program {
+    static int EnvInt(string name, int dflt) {
+        var n: int = 0
+        @c {
+            const char* v = getenv((const char*) name);
+            n = (v && v[0]) ? atoi(v) : (long long) dflt;
+        }
+        return n
+    }
+    static string EnvStr(string name, string dflt) {
+        var out: string = dflt
+        @c {
+            const char* v = getenv((const char*) name);
+            if (v && v[0]) out = (code_string) v;
+        }
+        return out
+    }
+
+    public static void Main(string[] args) {
+        let lp: int    = Program.EnvInt("NS_LISTEN", 0)
+        let uh: string = Program.EnvStr("NS_UPSTREAM_HOST", "")
+        let up: int    = Program.EnvInt("NS_UPSTREAM_PORT", 0)
+        let maxC: int  = Program.EnvInt("NS_MAX_CONNS", 256)
+        let maxIp: int = Program.EnvInt("NS_MAX_PER_IP", 32)
+        let idle: int  = Program.EnvInt("NS_IDLE_MS", 3000)
+
+        Console.WriteLine("tcp_forward: :" + String_FromInt(lp) + " -> " + uh + ":" + String_FromInt(up))
+
+        let rc: int = TcpProxy.New()
+            .Listen(lp)
+            .Forward(uh, up)
+            .IdleTimeout(idle)        // idle teardown
+            .ConnectTimeout(2000)
+            .MaxConnections(maxC)
+            .MaxPerIp(maxIp)
+            .Serve()
+
+        Console.WriteLine("tcp_forward: exited rc=" + String_FromInt(rc))
+    }
+}

@@ -1,0 +1,132 @@
+// amalgame-net-stream — raw L4 (TCP) stream proxy (v0.1.0).
+//
+// The nginx `stream {}` / HAProxy TCP-mode slice: forward a local TCP
+// port to a fixed upstream host:port, splicing raw bytes both ways. Use
+// it to front a database, a message broker, or any opaque TCP protocol
+// without parsing the payload.
+//
+//   import Amalgame.Net.Stream
+//
+//   TcpProxy.New()
+//       .Listen(6432)                       // local port clients hit
+//       .Forward("pg-primary.internal", 5432)  // upstream host:port
+//       .Serve()                            // blocks until SIGINT/SIGTERM
+//
+// The byte pump is binary-safe (explicit recv/send lengths in the C
+// engine, runtime/Amalgame_Net_Stream.h) so TLS records, the Postgres /
+// Redis / MQTT wire protocols, and any payload containing NUL bytes pass
+// through intact — unlike the bundled Amalgame.Net TcpConn primitives,
+// which strlen() the buffer and truncate at the first NUL.
+//
+// Security is wired in by default, not bolted on:
+//   - SIGPIPE ignored (a write to a dead peer never kills the proxy).
+//   - Per-connection idle timeout (slowloris / zombie defense).
+//   - Upstream connect timeout (a hung backend can't pin a worker).
+//   - Global + per-source-IP connection caps (flood blunting; over-cap
+//     connections are closed immediately — no queue, no OOM).
+//   - Graceful shutdown on SIGINT/SIGTERM (in-flight streams drain).
+//   - Bounded splice buffer (clamped 1 KiB .. 1 MiB by the engine).
+//
+// NOTE on SSRF: the upstream is fixed by the operator at config time,
+// never derived from client input, so the "deny RFC1918" guard used by
+// HttpClient.GetGuarded is deliberately NOT applied here — a stream
+// proxy's whole purpose is to front an internal (private-IP) service.
+//
+// What v0.1.0 does NOT do yet (honest scope — see README "Limitations"):
+//   - UDP forwarding (the "/U" half of nginx stream{}). v0.2 target.
+//   - Load balancing across N upstreams. v0.2 target.
+//   - IPv6 listener / dual-stack bind (upstream dial already accepts v6;
+//     only the *listen* side is IPv4 today). Tracked.
+//   - TLS termination / origination at the proxy edge. v0.3 target.
+
+namespace Amalgame.Net.Stream
+
+public class TcpProxy {
+    public ListenPort:       int     // local port to bind (1-65535)
+    public UpstreamHost:     string  // fixed upstream host (operator-set)
+    public UpstreamPort:     int     // fixed upstream port (1-65535)
+    public ConnectTimeoutMs: int     // upstream dial timeout (0 = block)
+    public IdleTimeoutMs:    int     // per-stream idle teardown (0 = none)
+    public MaxConns:         int     // global concurrent cap (0 = unlimited)
+    public MaxPerIp:         int     // per-source-IP cap (0 = unlimited)
+    public Backlog:          int     // listen() backlog
+    public BufSize:          int     // splice buffer bytes (engine clamps)
+
+    public TcpProxy() {
+        this.ListenPort       = 0
+        this.UpstreamHost     = ""
+        this.UpstreamPort     = 0
+        this.ConnectTimeoutMs = 5000      // 5 s
+        this.IdleTimeoutMs    = 60000     // 60 s
+        this.MaxConns         = 1024
+        this.MaxPerIp         = 64
+        this.Backlog          = 128
+        this.BufSize          = 65536      // 64 KiB
+    }
+
+    public static TcpProxy New() { return new TcpProxy() }
+
+    // ---- fluent configuration --------------------------------------
+
+    public TcpProxy Listen(int port)            { this.ListenPort = port; return this }
+    public TcpProxy Forward(string host, int port) {
+        this.UpstreamHost = host
+        this.UpstreamPort = port
+        return this
+    }
+    public TcpProxy ConnectTimeout(int ms)      { this.ConnectTimeoutMs = ms; return this }
+    public TcpProxy IdleTimeout(int ms)         { this.IdleTimeoutMs = ms;    return this }
+    public TcpProxy MaxConnections(int n)       { this.MaxConns = n;          return this }
+    public TcpProxy MaxPerIp(int n)             { this.MaxPerIp = n;          return this }
+    public TcpProxy ListenBacklog(int n)        { this.Backlog = n;           return this }
+    public TcpProxy BufferSize(int bytes)       { this.BufSize = bytes;       return this }
+
+    // ---- validation (pure, network-free — unit-testable) -----------
+    //
+    // Returns "" when the configuration is serveable, otherwise a human
+    // error string. Serve() calls this first and fails closed.
+    public string Validate() {
+        if (this.ListenPort <= 0)        { return "listen port not set (call Listen)" }
+        if (this.ListenPort > 65535)     { return "listen port out of range (1-65535)" }
+        if (String_Length(this.UpstreamHost) == 0) { return "upstream host not set (call Forward)" }
+        if (this.UpstreamPort <= 0)      { return "upstream port not set (call Forward)" }
+        if (this.UpstreamPort > 65535)   { return "upstream port out of range (1-65535)" }
+        if (this.ConnectTimeoutMs < 0)   { return "connect timeout must be >= 0" }
+        if (this.IdleTimeoutMs < 0)      { return "idle timeout must be >= 0" }
+        if (this.MaxConns < 0)           { return "max connections must be >= 0" }
+        if (this.MaxPerIp < 0)           { return "max per-ip must be >= 0" }
+        return ""
+    }
+
+    // ---- run -------------------------------------------------------
+    //
+    // Binds the listen port and serves forever (thread-per-connection),
+    // returning only after SIGINT/SIGTERM. Return value:
+    //    0  clean shutdown
+    //   -1  invalid configuration (Validate failed)
+    //   -2  socket()    -3 setsockopt    -4 bind    -5 listen
+    // (engine codes -1..-4 are shifted by one so -1 means "bad config").
+    public int Serve() {
+        let err: string = this.Validate()
+        if (String_Length(err) > 0) { return -1 }
+
+        let port:  int    = this.ListenPort
+        let host:  string = this.UpstreamHost
+        let uport: int    = this.UpstreamPort
+        let ctmo:  int    = this.ConnectTimeoutMs
+        let itmo:  int    = this.IdleTimeoutMs
+        let mc:    int    = this.MaxConns
+        let mpi:   int    = this.MaxPerIp
+        let bl:    int    = this.Backlog
+        let bs:    int    = this.BufSize
+        var rc:    int    = 0
+        @c {
+            long long _r = NetStream_RunTcp(
+                (long long) port, (const char*) host, (long long) uport,
+                (long long) ctmo, (long long) itmo, (long long) mc,
+                (long long) mpi, (long long) bl, (long long) bs);
+            rc = (_r < 0) ? (_r - 1) : _r;   /* shift engine errors past -1 */
+        }
+        return rc
+    }
+}
