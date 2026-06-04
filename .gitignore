@@ -1,0 +1,5 @@
+*.o
+*.c
+/amc
+amalgame.lock
+.amweb-cache/

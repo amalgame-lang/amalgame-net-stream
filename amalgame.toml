@@ -1,0 +1,14 @@
+[package]
+name              = "amalgame-net-stream"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Raw L4 TCP stream proxy for the Mosaic stack — binary-safe byte splicing to a fixed upstream (the nginx stream{} / HAProxy TCP-mode slice). Security wired in by default: idle + connect timeouts, global & per-source-IP connection caps, SIGPIPE-safe, graceful shutdown. v0.1.0: TCP only (UDP forwarding, load-balancing, IPv6 listener and TLS edge are tracked follow-ups)."
+required-amalgame = ">=0.8.58"
+schema-version    = 1
+
+[stdlib]
+classes   = ["TcpProxy"]
+header    = "runtime/Amalgame_Net_Stream.h"
+namespace = "Amalgame.Net.Stream"
+facade    = "facade.am"
+libs      = ["pthread"]

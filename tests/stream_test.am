@@ -1,0 +1,91 @@
+// Unit tests for TcpProxy — the network-free surface: builder wiring,
+// configuration validation (fail-closed), and the security-sane
+// defaults. The actual byte-splice round-trip (incl. binary-safety with
+// embedded NUL bytes) needs a live backend and is exercised by the
+// integration test in tests/run_tests.sh.
+
+namespace Tests
+
+import Amalgame.String
+import Amalgame.Net.Stream
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-stream — TcpProxy tests")
+        var pass: int = 0
+        var fail: int = 0
+
+        // ── 1. A fully configured proxy validates clean ──────────
+        let ok = TcpProxy.New().Listen(6432).Forward("db.internal", 5432)
+        if (String_Length(ok.Validate()) == 0) {
+            Console.WriteLine("[PASS] valid config → Validate() == \"\"")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] valid config rejected: " + ok.Validate())
+            fail = fail + 1
+        }
+
+        // ── 2. Missing listen port → fail closed ─────────────────
+        let noListen = TcpProxy.New().Forward("db.internal", 5432)
+        if (String_Length(noListen.Validate()) > 0) {
+            Console.WriteLine("[PASS] missing listen port rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] missing listen port accepted")
+            fail = fail + 1
+        }
+
+        // ── 3. Missing upstream → fail closed ────────────────────
+        let noUp = TcpProxy.New().Listen(6432)
+        if (String_Length(noUp.Validate()) > 0) {
+            Console.WriteLine("[PASS] missing upstream rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] missing upstream accepted")
+            fail = fail + 1
+        }
+
+        // ── 4. Out-of-range port → fail closed ───────────────────
+        let badPort = TcpProxy.New().Listen(70000).Forward("db.internal", 5432)
+        if (String_Length(badPort.Validate()) > 0) {
+            Console.WriteLine("[PASS] out-of-range listen port rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] out-of-range listen port accepted")
+            fail = fail + 1
+        }
+
+        // ── 5. Out-of-range upstream port → fail closed ──────────
+        let badUp = TcpProxy.New().Listen(6432).Forward("db.internal", 99999)
+        if (String_Length(badUp.Validate()) > 0) {
+            Console.WriteLine("[PASS] out-of-range upstream port rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] out-of-range upstream port accepted")
+            fail = fail + 1
+        }
+
+        // ── 6. Security-sane defaults are present ────────────────
+        let d = TcpProxy.New()
+        if (d.IdleTimeoutMs > 0 && d.ConnectTimeoutMs > 0 && d.MaxConns > 0 && d.MaxPerIp > 0) {
+            Console.WriteLine("[PASS] defaults: idle/connect timeouts + conn caps all set")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] a security default is unset (idle=" + String_FromInt(d.IdleTimeoutMs) + " conn=" + String_FromInt(d.ConnectTimeoutMs) + " max=" + String_FromInt(d.MaxConns) + " perip=" + String_FromInt(d.MaxPerIp) + ")")
+            fail = fail + 1
+        }
+
+        // ── 7. Builder overrides take effect ─────────────────────
+        let c = TcpProxy.New().IdleTimeout(15000).MaxConnections(10).MaxPerIp(2)
+        if (c.IdleTimeoutMs == 15000 && c.MaxConns == 10 && c.MaxPerIp == 2) {
+            Console.WriteLine("[PASS] builder overrides applied")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] builder overrides not applied")
+            fail = fail + 1
+        }
+
+        Console.WriteLine("")
+        Console.WriteLine("Summary: " + String_FromInt(pass) + " passed, " + String_FromInt(fail) + " failed")
+    }
+}
