@@ -85,6 +85,100 @@ public class Program {
             fail = fail + 1
         }
 
+        // ── 8. UdpProxy: a fully configured proxy validates clean ─
+        let uok = UdpProxy.New().Listen(5300).Forward("resolver.internal", 53)
+        if (String_Length(uok.Validate()) == 0) {
+            Console.WriteLine("[PASS] udp: valid config → Validate() == \"\"")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] udp: valid config rejected: " + uok.Validate())
+            fail = fail + 1
+        }
+
+        // ── 9. UdpProxy: missing upstream → fail closed ──────────
+        let uNoUp = UdpProxy.New().Listen(5300)
+        if (String_Length(uNoUp.Validate()) > 0) {
+            Console.WriteLine("[PASS] udp: missing upstream rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] udp: missing upstream accepted")
+            fail = fail + 1
+        }
+
+        // ── 10. UdpProxy: out-of-range listen port → fail closed ─
+        let uBadPort = UdpProxy.New().Listen(70000).Forward("resolver.internal", 53)
+        if (String_Length(uBadPort.Validate()) > 0) {
+            Console.WriteLine("[PASS] udp: out-of-range listen port rejected")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] udp: out-of-range listen port accepted")
+            fail = fail + 1
+        }
+
+        // ── 11. UdpProxy: security-sane defaults present ──────────
+        let ud = UdpProxy.New()
+        if (ud.IdleTimeoutMs > 0 && ud.MaxSessions > 0 && ud.MaxPerIp > 0) {
+            Console.WriteLine("[PASS] udp: defaults: idle timeout + session caps all set")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] udp: a security default is unset (idle=" + String_FromInt(ud.IdleTimeoutMs) + " max=" + String_FromInt(ud.MaxSessions) + " perip=" + String_FromInt(ud.MaxPerIp) + ")")
+            fail = fail + 1
+        }
+
+        // ── 12. UdpProxy: builder overrides take effect ──────────
+        let uc = UdpProxy.New().IdleTimeout(12000).MaxConnections(8).MaxPerIp(3)
+        if (uc.IdleTimeoutMs == 12000 && uc.MaxSessions == 8 && uc.MaxPerIp == 3) {
+            Console.WriteLine("[PASS] udp: builder overrides applied")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] udp: builder overrides not applied")
+            fail = fail + 1
+        }
+
+        // ── 13. Multi-upstream pool: AddUpstream builds the CSV ───
+        let pool = TcpProxy.New().Listen(6432).Forward("a.internal", 1).AddUpstream("b.internal", 2).AddUpstream("c.internal", 3)
+        if (pool.Upstreams == "a.internal:1,b.internal:2,c.internal:3") {
+            Console.WriteLine("[PASS] pool: AddUpstream builds host:port CSV")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: CSV wrong: " + pool.Upstreams)
+            fail = fail + 1
+        }
+
+        // ── 14. Forward resets the pool to a single upstream ─────
+        let reset = TcpProxy.New().AddUpstream("a.internal", 1).Forward("only.internal", 9)
+        if (reset.Upstreams == "only.internal:9") {
+            Console.WriteLine("[PASS] pool: Forward resets to single upstream")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: Forward did not reset: " + reset.Upstreams)
+            fail = fail + 1
+        }
+
+        // ── 15. AddUpstream alone seeds the primary (Validate ok) ─
+        let seed = UdpProxy.New().Listen(53).AddUpstream("a.internal", 53)
+        if (String_Length(seed.Validate()) == 0 && seed.Upstreams == "a.internal:53") {
+            Console.WriteLine("[PASS] pool: AddUpstream seeds primary for Validate")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: AddUpstream did not seed primary")
+            fail = fail + 1
+        }
+
+        // ── 16. Strategy selectors + StreamStrategy.ToCode map ───
+        let st = TcpProxy.New().LeastConnections()
+        if (st.Strategy == "least_conn"
+            && StreamStrategy.ToCode("round_robin") == 0
+            && StreamStrategy.ToCode("ip_hash") == 1
+            && StreamStrategy.ToCode("least_conn") == 2
+            && StreamStrategy.ToCode("bogus") == 0) {
+            Console.WriteLine("[PASS] strategy: selectors + ToCode mapping (RR/ip_hash/least_conn/fallback)")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] strategy: selector or ToCode mapping wrong (got " + st.Strategy + ")")
+            fail = fail + 1
+        }
+
         Console.WriteLine("")
         Console.WriteLine("Summary: " + String_FromInt(pass) + " passed, " + String_FromInt(fail) + " failed")
     }

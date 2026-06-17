@@ -41,6 +41,17 @@
 
 namespace Amalgame.Net.Stream
 
+// Maps a load-balancing strategy name to the engine's integer code
+// (0 round_robin, 1 ip_hash, 2 least_conn). Shared by TcpProxy and
+// UdpProxy; unknown names fall back to round_robin.
+public class StreamStrategy {
+    public static int ToCode(string s) {
+        if (s == "ip_hash")    { return 1 }
+        if (s == "least_conn") { return 2 }
+        return 0   // round_robin (default)
+    }
+}
+
 public class TcpProxy {
     public ListenPort:       int     // local port to bind (1-65535)
     public UpstreamHost:     string  // fixed upstream host (operator-set)
@@ -51,6 +62,8 @@ public class TcpProxy {
     public MaxPerIp:         int     // per-source-IP cap (0 = unlimited)
     public Backlog:          int     // listen() backlog
     public BufSize:          int     // splice buffer bytes (engine clamps)
+    public Upstreams:        string  // "host:port,host:port" pool (LB)
+    public Strategy:         string  // "round_robin" | "ip_hash" | "least_conn"
 
     public TcpProxy() {
         this.ListenPort       = 0
@@ -62,6 +75,8 @@ public class TcpProxy {
         this.MaxPerIp         = 64
         this.Backlog          = 128
         this.BufSize          = 65536      // 64 KiB
+        this.Upstreams        = ""
+        this.Strategy         = "round_robin"
     }
 
     public static TcpProxy New() { return new TcpProxy() }
@@ -69,11 +84,37 @@ public class TcpProxy {
     // ---- fluent configuration --------------------------------------
 
     public TcpProxy Listen(int port)            { this.ListenPort = port; return this }
+
+    // Set THE upstream (single-backend case) — resets any pool. Keeps the
+    // primary host/port for validation and is the first pool entry.
     public TcpProxy Forward(string host, int port) {
         this.UpstreamHost = host
         this.UpstreamPort = port
+        this.Upstreams    = host + ":" + String_FromInt(port)
         return this
     }
+
+    // Add another upstream to the load-balanced pool. The first upstream
+    // added (whether via Forward or AddUpstream) also seeds the primary
+    // host/port used by Validate().
+    public TcpProxy AddUpstream(string host, int port) {
+        let entry: string = host + ":" + String_FromInt(port)
+        if (String_Length(this.Upstreams) == 0) {
+            this.Upstreams    = entry
+            this.UpstreamHost = host
+            this.UpstreamPort = port
+        } else {
+            this.Upstreams = this.Upstreams + "," + entry
+        }
+        return this
+    }
+
+    // Load-balancing strategy across the pool (default round_robin).
+    public TcpProxy Strategy(string s)          { this.Strategy = s;             return this }
+    public TcpProxy RoundRobin()                { this.Strategy = "round_robin"; return this }
+    public TcpProxy IpHash()                    { this.Strategy = "ip_hash";     return this }
+    public TcpProxy LeastConnections()          { this.Strategy = "least_conn";  return this }
+
     public TcpProxy ConnectTimeout(int ms)      { this.ConnectTimeoutMs = ms; return this }
     public TcpProxy IdleTimeout(int ms)         { this.IdleTimeoutMs = ms;    return this }
     public TcpProxy MaxConnections(int n)       { this.MaxConns = n;          return this }
@@ -111,8 +152,8 @@ public class TcpProxy {
         if (String_Length(err) > 0) { return -1 }
 
         let port:  int    = this.ListenPort
-        let host:  string = this.UpstreamHost
-        let uport: int    = this.UpstreamPort
+        let ups:   string = this.Upstreams
+        let strat: int    = StreamStrategy.ToCode(this.Strategy)
         let ctmo:  int    = this.ConnectTimeoutMs
         let itmo:  int    = this.IdleTimeoutMs
         let mc:    int    = this.MaxConns
@@ -122,9 +163,141 @@ public class TcpProxy {
         var rc:    int    = 0
         @c {
             long long _r = NetStream_RunTcp(
-                (long long) port, (const char*) host, (long long) uport,
+                (long long) port, (const char*) ups, (long long) strat,
                 (long long) ctmo, (long long) itmo, (long long) mc,
                 (long long) mpi, (long long) bl, (long long) bs);
+            rc = (_r < 0) ? (_r - 1) : _r;   /* shift engine errors past -1 */
+        }
+        return rc
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  UdpProxy — raw L4 UDP datagram proxy (the "/U" half of nginx stream{}).
+//
+//   import Amalgame.Net.Stream
+//
+//   UdpProxy.New()
+//       .Listen(53)                       // local UDP port clients hit
+//       .Forward("resolver.internal", 53) // fixed upstream host:port
+//       .Serve()                          // blocks until SIGINT/SIGTERM
+//
+// UDP is connectionless, so the engine keeps a per-client *session* table
+// (keyed by the client's address:port) rather than spawning a thread per
+// connection. Each session owns a dedicated upstream socket; replies are
+// routed back to the originating client. Datagram boundaries are
+// preserved end to end, and the buffer holds a full IPv4 UDP payload so
+// nothing is silently truncated.
+//
+// Idle timeout is mandatory here, not just a defense: UDP has no FIN, so a
+// session that goes silent for IdleTimeout(ms) is the only signal it is
+// over — it is then reaped (upstream fd closed, caps released).
+//
+// Caps mirror TcpProxy and fail CLOSED: over the global session cap, over
+// the per-source-IP cap, or with the session table full, the new client's
+// datagram is dropped rather than queued. The SSRF note on TcpProxy
+// applies identically — the upstream is operator-fixed, never client-derived.
+public class UdpProxy {
+    public ListenPort:    int     // local UDP port to bind (1-65535)
+    public UpstreamHost:  string  // fixed upstream host (operator-set)
+    public UpstreamPort:  int     // fixed upstream port (1-65535)
+    public IdleTimeoutMs: int     // per-session idle teardown (0 = none)
+    public MaxSessions:   int     // global concurrent session cap (0 = hard cap)
+    public MaxPerIp:      int     // per-source-IP session cap (0 = unlimited)
+    public BufSize:       int     // datagram buffer bytes (engine clamps)
+    public Upstreams:     string  // "host:port,host:port" pool (LB)
+    public Strategy:      string  // "round_robin" | "ip_hash" | "least_conn"
+
+    public UdpProxy() {
+        this.ListenPort    = 0
+        this.UpstreamHost  = ""
+        this.UpstreamPort  = 0
+        this.IdleTimeoutMs = 30000     // 30 s — UDP sessions are ephemeral
+        this.MaxSessions   = 1024
+        this.MaxPerIp      = 64
+        this.BufSize       = 65536     // 64 KiB (covers max IPv4 UDP payload)
+        this.Upstreams     = ""
+        this.Strategy      = "round_robin"
+    }
+
+    public static UdpProxy New() { return new UdpProxy() }
+
+    // ---- fluent configuration --------------------------------------
+
+    public UdpProxy Listen(int port)             { this.ListenPort = port; return this }
+
+    // Set THE upstream (single-backend case) — resets any pool.
+    public UdpProxy Forward(string host, int port) {
+        this.UpstreamHost = host
+        this.UpstreamPort = port
+        this.Upstreams    = host + ":" + String_FromInt(port)
+        return this
+    }
+
+    // Add another upstream to the load-balanced pool. The first one added
+    // also seeds the primary host/port used by Validate().
+    public UdpProxy AddUpstream(string host, int port) {
+        let entry: string = host + ":" + String_FromInt(port)
+        if (String_Length(this.Upstreams) == 0) {
+            this.Upstreams    = entry
+            this.UpstreamHost = host
+            this.UpstreamPort = port
+        } else {
+            this.Upstreams = this.Upstreams + "," + entry
+        }
+        return this
+    }
+
+    // Load-balancing strategy across the pool (default round_robin).
+    // ip_hash is naturally sticky for UDP: a client keeps its upstream.
+    public UdpProxy Strategy(string s)           { this.Strategy = s;             return this }
+    public UdpProxy RoundRobin()                 { this.Strategy = "round_robin"; return this }
+    public UdpProxy IpHash()                     { this.Strategy = "ip_hash";     return this }
+    public UdpProxy LeastConnections()           { this.Strategy = "least_conn";  return this }
+
+    public UdpProxy IdleTimeout(int ms)          { this.IdleTimeoutMs = ms; return this }
+    public UdpProxy MaxConnections(int n)        { this.MaxSessions = n;    return this }
+    public UdpProxy MaxPerIp(int n)              { this.MaxPerIp = n;       return this }
+    public UdpProxy BufferSize(int bytes)        { this.BufSize = bytes;    return this }
+
+    // ---- validation (pure, network-free — unit-testable) -----------
+    public string Validate() {
+        if (this.ListenPort <= 0)        { return "listen port not set (call Listen)" }
+        if (this.ListenPort > 65535)     { return "listen port out of range (1-65535)" }
+        if (String_Length(this.UpstreamHost) == 0) { return "upstream host not set (call Forward)" }
+        if (this.UpstreamPort <= 0)      { return "upstream port not set (call Forward)" }
+        if (this.UpstreamPort > 65535)   { return "upstream port out of range (1-65535)" }
+        if (this.IdleTimeoutMs < 0)      { return "idle timeout must be >= 0" }
+        if (this.MaxSessions < 0)        { return "max sessions must be >= 0" }
+        if (this.MaxPerIp < 0)           { return "max per-ip must be >= 0" }
+        return ""
+    }
+
+    // ---- run -------------------------------------------------------
+    //
+    // Binds the listen port and serves forever (single event-loop thread),
+    // returning only after SIGINT/SIGTERM. Return value:
+    //    0  clean shutdown
+    //   -1  invalid configuration (Validate failed)
+    //   -2  no usable upstream  -4 listen-setup  -6 all upstreams unresolvable
+    // (engine codes are shifted by one so -1 means "bad config").
+    public int Serve() {
+        let err: string = this.Validate()
+        if (String_Length(err) > 0) { return -1 }
+
+        let port:  int    = this.ListenPort
+        let ups:   string = this.Upstreams
+        let strat: int    = StreamStrategy.ToCode(this.Strategy)
+        let itmo:  int    = this.IdleTimeoutMs
+        let ms:    int    = this.MaxSessions
+        let mpi:   int    = this.MaxPerIp
+        let bs:    int    = this.BufSize
+        var rc:    int    = 0
+        @c {
+            long long _r = NetStream_RunUdp(
+                (long long) port, (const char*) ups, (long long) strat,
+                (long long) itmo, (long long) ms, (long long) mpi,
+                (long long) bs);
             rc = (_r < 0) ? (_r - 1) : _r;   /* shift engine errors past -1 */
         }
         return rc
