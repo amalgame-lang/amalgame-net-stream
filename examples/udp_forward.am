@@ -1,0 +1,58 @@
+// examples/udp_forward.am — minimal UDP datagram proxy runner.
+//
+// Reads its configuration from the environment so it needs no argv
+// plumbing:
+//
+//   NS_LISTEN=5300 NS_UPSTREAM_HOST=1.1.1.1 NS_UPSTREAM_PORT=53 \
+//       udp_forward
+//
+// Forwards a local UDP port to a fixed upstream, preserving datagram
+// boundaries. Each distinct client (address:port) gets its own session
+// with a dedicated upstream socket; replies are routed back to the right
+// client. Used by tests/run_tests.sh to prove datagram round-trips
+// (incl. embedded NUL bytes) and per-source-IP capping. Ctrl-C (SIGINT)
+// / SIGTERM shuts it down gracefully.
+
+namespace Example
+
+import Amalgame.Net.Stream
+
+public class Program {
+    static int EnvInt(string name, int dflt) {
+        var n: int = 0
+        @c {
+            const char* v = getenv((const char*) name);
+            n = (v && v[0]) ? atoi(v) : (long long) dflt;
+        }
+        return n
+    }
+    static string EnvStr(string name, string dflt) {
+        var out: string = dflt
+        @c {
+            const char* v = getenv((const char*) name);
+            if (v && v[0]) out = (code_string) v;
+        }
+        return out
+    }
+
+    public static void Main(string[] args) {
+        let lp: int    = Program.EnvInt("NS_LISTEN", 0)
+        let uh: string = Program.EnvStr("NS_UPSTREAM_HOST", "")
+        let up: int    = Program.EnvInt("NS_UPSTREAM_PORT", 0)
+        let maxS: int  = Program.EnvInt("NS_MAX_SESSIONS", 256)
+        let maxIp: int = Program.EnvInt("NS_MAX_PER_IP", 32)
+        let idle: int  = Program.EnvInt("NS_IDLE_MS", 3000)
+
+        Console.WriteLine("udp_forward: :" + String_FromInt(lp) + " -> " + uh + ":" + String_FromInt(up) + " (udp)")
+
+        let rc: int = UdpProxy.New()
+            .Listen(lp)
+            .Forward(uh, up)
+            .IdleTimeout(idle)        // idle session reap (mandatory for UDP)
+            .MaxConnections(maxS)
+            .MaxPerIp(maxIp)
+            .Serve()
+
+        Console.WriteLine("udp_forward: exited rc=" + String_FromInt(rc))
+    }
+}

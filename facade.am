@@ -130,3 +130,106 @@ public class TcpProxy {
         return rc
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+//  UdpProxy — raw L4 UDP datagram proxy (the "/U" half of nginx stream{}).
+//
+//   import Amalgame.Net.Stream
+//
+//   UdpProxy.New()
+//       .Listen(53)                       // local UDP port clients hit
+//       .Forward("resolver.internal", 53) // fixed upstream host:port
+//       .Serve()                          // blocks until SIGINT/SIGTERM
+//
+// UDP is connectionless, so the engine keeps a per-client *session* table
+// (keyed by the client's address:port) rather than spawning a thread per
+// connection. Each session owns a dedicated upstream socket; replies are
+// routed back to the originating client. Datagram boundaries are
+// preserved end to end, and the buffer holds a full IPv4 UDP payload so
+// nothing is silently truncated.
+//
+// Idle timeout is mandatory here, not just a defense: UDP has no FIN, so a
+// session that goes silent for IdleTimeout(ms) is the only signal it is
+// over — it is then reaped (upstream fd closed, caps released).
+//
+// Caps mirror TcpProxy and fail CLOSED: over the global session cap, over
+// the per-source-IP cap, or with the session table full, the new client's
+// datagram is dropped rather than queued. The SSRF note on TcpProxy
+// applies identically — the upstream is operator-fixed, never client-derived.
+public class UdpProxy {
+    public ListenPort:    int     // local UDP port to bind (1-65535)
+    public UpstreamHost:  string  // fixed upstream host (operator-set)
+    public UpstreamPort:  int     // fixed upstream port (1-65535)
+    public IdleTimeoutMs: int     // per-session idle teardown (0 = none)
+    public MaxSessions:   int     // global concurrent session cap (0 = hard cap)
+    public MaxPerIp:      int     // per-source-IP session cap (0 = unlimited)
+    public BufSize:       int     // datagram buffer bytes (engine clamps)
+
+    public UdpProxy() {
+        this.ListenPort    = 0
+        this.UpstreamHost  = ""
+        this.UpstreamPort  = 0
+        this.IdleTimeoutMs = 30000     // 30 s — UDP sessions are ephemeral
+        this.MaxSessions   = 1024
+        this.MaxPerIp      = 64
+        this.BufSize       = 65536     // 64 KiB (covers max IPv4 UDP payload)
+    }
+
+    public static UdpProxy New() { return new UdpProxy() }
+
+    // ---- fluent configuration --------------------------------------
+
+    public UdpProxy Listen(int port)             { this.ListenPort = port; return this }
+    public UdpProxy Forward(string host, int port) {
+        this.UpstreamHost = host
+        this.UpstreamPort = port
+        return this
+    }
+    public UdpProxy IdleTimeout(int ms)          { this.IdleTimeoutMs = ms; return this }
+    public UdpProxy MaxConnections(int n)        { this.MaxSessions = n;    return this }
+    public UdpProxy MaxPerIp(int n)              { this.MaxPerIp = n;       return this }
+    public UdpProxy BufferSize(int bytes)        { this.BufSize = bytes;    return this }
+
+    // ---- validation (pure, network-free — unit-testable) -----------
+    public string Validate() {
+        if (this.ListenPort <= 0)        { return "listen port not set (call Listen)" }
+        if (this.ListenPort > 65535)     { return "listen port out of range (1-65535)" }
+        if (String_Length(this.UpstreamHost) == 0) { return "upstream host not set (call Forward)" }
+        if (this.UpstreamPort <= 0)      { return "upstream port not set (call Forward)" }
+        if (this.UpstreamPort > 65535)   { return "upstream port out of range (1-65535)" }
+        if (this.IdleTimeoutMs < 0)      { return "idle timeout must be >= 0" }
+        if (this.MaxSessions < 0)        { return "max sessions must be >= 0" }
+        if (this.MaxPerIp < 0)           { return "max per-ip must be >= 0" }
+        return ""
+    }
+
+    // ---- run -------------------------------------------------------
+    //
+    // Binds the listen port and serves forever (single event-loop thread),
+    // returning only after SIGINT/SIGTERM. Return value:
+    //    0  clean shutdown
+    //   -1  invalid configuration (Validate failed)
+    //   -2  socket()  -3 setsockopt  -4 bind  -6 upstream resolve
+    // (engine codes are shifted by one so -1 means "bad config").
+    public int Serve() {
+        let err: string = this.Validate()
+        if (String_Length(err) > 0) { return -1 }
+
+        let port:  int    = this.ListenPort
+        let host:  string = this.UpstreamHost
+        let uport: int    = this.UpstreamPort
+        let itmo:  int    = this.IdleTimeoutMs
+        let ms:    int    = this.MaxSessions
+        let mpi:   int    = this.MaxPerIp
+        let bs:    int    = this.BufSize
+        var rc:    int    = 0
+        @c {
+            long long _r = NetStream_RunUdp(
+                (long long) port, (const char*) host, (long long) uport,
+                (long long) itmo, (long long) ms, (long long) mpi,
+                (long long) bs);
+            rc = (_r < 0) ? (_r - 1) : _r;   /* shift engine errors past -1 */
+        }
+        return rc
+    }
+}
