@@ -1,13 +1,13 @@
 [package]
 name              = "amalgame-net-stream"
-version           = "0.2.0"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Raw L4 TCP + UDP stream proxy for the Mosaic stack — binary-safe byte splicing (TCP) and datagram forwarding (UDP) to a fixed upstream (the nginx stream{} / HAProxy TCP+UDP-mode slice). Security wired in by default: idle (+ connect) timeouts, global & per-source-IP caps, SIGPIPE-safe, graceful shutdown. v0.2.0 adds UDP; load-balancing, IPv6 listener and TLS edge are tracked follow-ups."
+description       = "Raw L4 TCP + UDP stream proxy for the Mosaic stack — binary-safe byte splicing (TCP) and datagram forwarding (UDP) to one or more upstreams (the nginx stream{} / HAProxy TCP+UDP-mode slice). Load-balancing (round-robin / ip-hash / least-conn) with failover, IPv6 dual-stack listener, and security wired in by default: idle (+ connect) timeouts, global & per-source-IP caps, SIGPIPE-safe, graceful shutdown. TLS/DTLS edge is the tracked follow-up."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
 [stdlib]
-classes   = ["TcpProxy", "UdpProxy"]
+classes   = ["TcpProxy", "UdpProxy", "StreamStrategy"]
 header    = "runtime/Amalgame_Net_Stream.h"
 namespace = "Amalgame.Net.Stream"
 facade    = "facade.am"

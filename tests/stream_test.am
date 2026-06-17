@@ -135,6 +135,50 @@ public class Program {
             fail = fail + 1
         }
 
+        // ── 13. Multi-upstream pool: AddUpstream builds the CSV ───
+        let pool = TcpProxy.New().Listen(6432).Forward("a.internal", 1).AddUpstream("b.internal", 2).AddUpstream("c.internal", 3)
+        if (pool.Upstreams == "a.internal:1,b.internal:2,c.internal:3") {
+            Console.WriteLine("[PASS] pool: AddUpstream builds host:port CSV")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: CSV wrong: " + pool.Upstreams)
+            fail = fail + 1
+        }
+
+        // ── 14. Forward resets the pool to a single upstream ─────
+        let reset = TcpProxy.New().AddUpstream("a.internal", 1).Forward("only.internal", 9)
+        if (reset.Upstreams == "only.internal:9") {
+            Console.WriteLine("[PASS] pool: Forward resets to single upstream")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: Forward did not reset: " + reset.Upstreams)
+            fail = fail + 1
+        }
+
+        // ── 15. AddUpstream alone seeds the primary (Validate ok) ─
+        let seed = UdpProxy.New().Listen(53).AddUpstream("a.internal", 53)
+        if (String_Length(seed.Validate()) == 0 && seed.Upstreams == "a.internal:53") {
+            Console.WriteLine("[PASS] pool: AddUpstream seeds primary for Validate")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] pool: AddUpstream did not seed primary")
+            fail = fail + 1
+        }
+
+        // ── 16. Strategy selectors + StreamStrategy.ToCode map ───
+        let st = TcpProxy.New().LeastConnections()
+        if (st.Strategy == "least_conn"
+            && StreamStrategy.ToCode("round_robin") == 0
+            && StreamStrategy.ToCode("ip_hash") == 1
+            && StreamStrategy.ToCode("least_conn") == 2
+            && StreamStrategy.ToCode("bogus") == 0) {
+            Console.WriteLine("[PASS] strategy: selectors + ToCode mapping (RR/ip_hash/least_conn/fallback)")
+            pass = pass + 1
+        } else {
+            Console.WriteLine("[FAIL] strategy: selector or ToCode mapping wrong (got " + st.Strategy + ")")
+            fail = fail + 1
+        }
+
         Console.WriteLine("")
         Console.WriteLine("Summary: " + String_FromInt(pass) + " passed, " + String_FromInt(fail) + " failed")
     }

@@ -32,7 +32,7 @@ fi
 
 HDR="$PKG_DIR/runtime/Amalgame_Net_Stream.h"
 BUILD_DIR=$(mktemp -d -t amalgame-net-stream-XXXXXX)
-trap 'rm -rf "$BUILD_DIR"; [ -n "${PROXY:-}" ] && kill "$PROXY" 2>/dev/null; [ -n "${BACK:-}" ] && kill "$BACK" 2>/dev/null; [ -n "${UPROXY:-}" ] && kill "$UPROXY" 2>/dev/null; [ -n "${UPROXY2:-}" ] && kill "$UPROXY2" 2>/dev/null; [ -n "${UBACK:-}" ] && kill "$UBACK" 2>/dev/null' EXIT
+trap 'rm -rf "$BUILD_DIR"; [ -n "${PROXY:-}" ] && kill "$PROXY" 2>/dev/null; [ -n "${BACK:-}" ] && kill "$BACK" 2>/dev/null; [ -n "${UPROXY:-}" ] && kill "$UPROXY" 2>/dev/null; [ -n "${UPROXY2:-}" ] && kill "$UPROXY2" 2>/dev/null; [ -n "${UBACK:-}" ] && kill "$UBACK" 2>/dev/null; for V in TLBPROXY TBA TBB ULBPROXY UBA UBB; do eval "P=\${$V:-}"; [ -n "$P" ] && kill "$P" 2>/dev/null; done' EXIT
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 echo "Using amc: $AMC"
@@ -223,6 +223,80 @@ finally:
 PY
 then echo -e "${GREEN}[PASS]${NC} over-cap udp session dropped; first two served"; else echo -e "${RED}[FAIL]${NC} udp per-IP cap not enforced"; FAILED=1; fi
 kill "$UPROXY2" 2>/dev/null; UPROXY2=""
+
+# ── 6. Multi-upstream load balancing (round-robin distribution) ──────
+#      Two identity backends; a round-robin proxy in front. Several
+#      connections / sessions must reach BOTH backends.
+echo -e "\n── TCP round-robin: connections reach both upstreams ──"
+# Identity TCP backends: announce a 1-byte id on connect, then echo.
+cat > "$BUILD_DIR/idtcp.py" <<'PY'
+import socket, threading, sys
+port = int(sys.argv[1]); ident = sys.argv[2].encode()
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(16)
+def h(c):
+    try:
+        c.sendall(ident)
+        while True:
+            d = c.recv(4096)
+            if not d: break
+            c.sendall(d)
+    except Exception: pass
+    finally: c.close()
+while True:
+    try: c, _ = srv.accept()
+    except Exception: break
+    threading.Thread(target=h, args=(c,), daemon=True).start()
+PY
+python3 "$BUILD_DIR/idtcp.py" 19031 A & TBA=$!
+python3 "$BUILD_DIR/idtcp.py" 19032 B & TBB=$!
+sleep 0.3
+NS_LISTEN=19030 NS_UPSTREAM_HOST=127.0.0.1 NS_UPSTREAM_PORT=19031 \
+    NS_UPSTREAM2_HOST=127.0.0.1 NS_UPSTREAM2_PORT=19032 NS_STRATEGY=round_robin \
+    "$BUILD_DIR/proxy" >/dev/null 2>&1 & TLBPROXY=$!
+sleep 0.4
+if python3 - <<'PY'
+import socket, sys
+seen = set()
+for _ in range(6):
+    s = socket.create_connection(("127.0.0.1", 19030), timeout=3)
+    seen.add(s.recv(1)); s.close()
+sys.exit(0 if seen == {b"A", b"B"} else 1)
+PY
+then echo -e "${GREEN}[PASS]${NC} round-robin hit both TCP upstreams"; else echo -e "${RED}[FAIL]${NC} round-robin did not balance TCP"; FAILED=1; fi
+kill "$TLBPROXY" "$TBA" "$TBB" 2>/dev/null; TLBPROXY=""; TBA=""; TBB=""
+
+echo -e "\n── UDP round-robin: sessions reach both upstreams ──"
+# Identity UDP backends: reply with id-prefixed datagram.
+cat > "$BUILD_DIR/idudp.py" <<'PY'
+import socket, sys
+port = int(sys.argv[1]); ident = sys.argv[2].encode()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+while True:
+    try: data, addr = s.recvfrom(65536)
+    except Exception: break
+    s.sendto(ident + data, addr)
+PY
+python3 "$BUILD_DIR/idudp.py" 19041 A & UBA=$!
+python3 "$BUILD_DIR/idudp.py" 19042 B & UBB=$!
+sleep 0.3
+NS_LISTEN=19040 NS_UPSTREAM_HOST=127.0.0.1 NS_UPSTREAM_PORT=19041 \
+    NS_UPSTREAM2_HOST=127.0.0.1 NS_UPSTREAM2_PORT=19042 NS_STRATEGY=round_robin \
+    NS_IDLE_MS=5000 "$BUILD_DIR/udp" >/dev/null 2>&1 & ULBPROXY=$!
+sleep 0.4
+if python3 - <<'PY'
+import socket, sys
+seen = set()
+for _ in range(6):                       # distinct source ports → distinct sessions
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+    s.sendto(b"q", ("127.0.0.1", 19040))
+    seen.add(s.recvfrom(8)[0][:1]); s.close()
+sys.exit(0 if seen == {b"A", b"B"} else 1)
+PY
+then echo -e "${GREEN}[PASS]${NC} round-robin hit both UDP upstreams"; else echo -e "${RED}[FAIL]${NC} round-robin did not balance UDP"; FAILED=1; fi
+kill "$ULBPROXY" "$UBA" "$UBB" 2>/dev/null; ULBPROXY=""; UBA=""; UBB=""
 
 echo -e "\n── udp graceful shutdown (SIGTERM) ──"
 kill -TERM "$UPROXY" 2>/dev/null
