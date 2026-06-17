@@ -397,4 +397,256 @@ static long long NetStream_RunTcp(long long listen_port,
     return 0;
 }
 
+/* ====================================================================
+ * UDP forwarding — the "/U" half of nginx `stream {}`.
+ *
+ * UDP is connectionless, so there is no accept() and no thread-per-conn
+ * model. A single event-loop thread owns one bound listen socket plus a
+ * table of per-client *sessions*. A session is keyed by the client's
+ * (address, port); each holds a dedicated upstream UDP socket connect()ed
+ * to the fixed upstream, so the kernel filters replies to that peer and a
+ * plain recv()/send() moves datagrams. Replies are routed back to the
+ * originating client with sendto() on the listen socket.
+ *
+ * Because the loop is single-threaded, the session table needs no lock
+ * (unlike the TCP per-IP table, which is shared across worker threads).
+ *
+ * Idle timeout is MANDATORY, not just a slowloris defense: UDP has no
+ * FIN, so a session that has gone silent for `idle_timeout_ms` is the
+ * *only* signal that it is over. Reaped sessions free their upstream fd
+ * and their slot in the global / per-IP accounting.
+ *
+ * Datagram boundaries are preserved: one recvfrom() → one send() upstream;
+ * one recv() from upstream → one sendto() to the client. The buffer is
+ * clamped to hold a maximum IPv4 UDP payload (65507 B) so a datagram is
+ * never silently truncated (a short buffer would drop the tail via
+ * MSG_TRUNC).
+ *
+ * Caps mirror the TCP side and fail CLOSED: over the global session cap,
+ * over the per-source-IP cap, or with the session table full, the new
+ * client's datagram is dropped rather than queued. Listener is IPv4
+ * (AF_INET) like the TCP side; the upstream dial accepts v4 or v6.
+ * ==================================================================== */
+
+#define AMNETSTREAM_UDP_HARD_SESSIONS 65536
+
+typedef struct {
+    int                     in_use;
+    int                     up_fd;       /* connected upstream UDP socket */
+    struct sockaddr_storage cli;         /* client addr for sendto() back */
+    socklen_t               cli_len;
+    char                    cli_ip[INET6_ADDRSTRLEN];
+    time_t                  last_active; /* for idle reaping */
+} amnetstream_udp_session;
+
+/* Two client datagrams belong to the same session iff their source
+ * (address, port) match. Listener is AF_INET, so this is the common
+ * path; the memcmp fallback keeps it correct for any other family. */
+static int amnetstream_udp_same_client(const amnetstream_udp_session* s,
+                                       const struct sockaddr_storage* a,
+                                       socklen_t alen) {
+    if (s->cli_len != alen || s->cli.ss_family != a->ss_family) return 0;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in* x = (const struct sockaddr_in*) &s->cli;
+        const struct sockaddr_in* y = (const struct sockaddr_in*) a;
+        return x->sin_port == y->sin_port &&
+               x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+    return memcmp(&s->cli, a, (size_t) alen) == 0;
+}
+
+/* Render the source IP of a client datagram into `out` (for per-IP cap
+ * accounting). Empty string if the family is unsupported. */
+static void amnetstream_udp_ip(const struct sockaddr_storage* a,
+                               char* out, size_t outlen) {
+    out[0] = '\0';
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in* x = (const struct sockaddr_in*) a;
+        inet_ntop(AF_INET, &x->sin_addr, out, (socklen_t) outlen);
+    } else if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6* x = (const struct sockaddr_in6*) a;
+        inet_ntop(AF_INET6, &x->sin6_addr, out, (socklen_t) outlen);
+    }
+}
+
+/* ---- the UDP run loop (entry point called from facade.am) ---------- *
+ * Blocks until a shutdown signal. Returns 0 on clean shutdown, or a
+ * negative code on a fatal setup error:
+ *   -1 socket()  -2 setsockopt  -3 bind  -5 upstream getaddrinfo
+ */
+static long long NetStream_RunUdp(long long listen_port,
+                                  const char* up_host,
+                                  long long up_port,
+                                  long long idle_timeout_ms,
+                                  long long max_sessions,
+                                  long long max_per_ip,
+                                  long long buf_size) {
+    amnetstream_install_signals();
+
+    int bsz = (int) buf_size;
+    if (bsz < 2048)  bsz = 2048;
+    if (bsz > 65536) bsz = 65536;          /* max IPv4 UDP payload 65507 */
+    int idle_ms = (int) idle_timeout_ms;
+
+    /* Resolve the fixed upstream once (first usable DGRAM result). */
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", (int) up_port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;          /* upstream may be v4 or v6 */
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo* res = NULL;
+    if (getaddrinfo(up_host, portstr, &hints, &res) != 0 || !res) {
+        if (res) freeaddrinfo(res);
+        return -5;
+    }
+    struct sockaddr_storage up_addr;
+    socklen_t up_len     = res->ai_addrlen;
+    int       up_family  = res->ai_family;
+    int       up_socktype = res->ai_socktype;
+    int       up_proto   = res->ai_protocol;
+    memcpy(&up_addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+
+    /* Listen socket (IPv4, non-blocking — we only read on POLLIN). */
+    int lfd = (int) socket(AF_INET, SOCK_DGRAM, 0);
+    if (lfd < 0) return -1;
+    int opt = 1;
+    if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        close(lfd); return -2;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons((uint16_t) listen_port);
+    if (bind(lfd, (struct sockaddr*) &addr, sizeof(addr)) < 0) { close(lfd); return -3; }
+    amnetstream_set_nonblock(lfd);
+    amnetstream_listen_fd = lfd;
+
+    /* Session table — single-threaded, so no lock. cap bounds memory and
+     * the pollfd array; 0 / over-large means "use the hard cap". */
+    int cap = (int) max_sessions;
+    if (cap <= 0 || cap > AMNETSTREAM_UDP_HARD_SESSIONS) cap = AMNETSTREAM_UDP_HARD_SESSIONS;
+
+    amnetstream_udp_session* sess =
+        (amnetstream_udp_session*) calloc((size_t) cap, sizeof(amnetstream_udp_session));
+    char*          buf  = (char*) malloc((size_t) bsz);
+    struct pollfd* pfds = (struct pollfd*) malloc(sizeof(struct pollfd) * (size_t)(cap + 1));
+    int*           pidx = (int*) malloc(sizeof(int) * (size_t)(cap + 1)); /* pfds[k] -> session idx (-1 = listener) */
+    if (!sess || !buf || !pfds || !pidx) {
+        free(sess); free(buf); free(pfds); free(pidx);
+        amnetstream_listen_fd = -1; close(lfd); return -1;
+    }
+
+    int active = 0;
+    int i;
+
+    while (!amnetstream_stopping) {
+        /* Build the poll set: listener + every in-use session upstream. */
+        int nf = 0;
+        pfds[nf].fd = lfd; pfds[nf].events = POLLIN; pidx[nf] = -1; nf++;
+        for (i = 0; i < cap; i++) {
+            if (sess[i].in_use) {
+                pfds[nf].fd = sess[i].up_fd; pfds[nf].events = POLLIN; pidx[nf] = i; nf++;
+            }
+        }
+
+        int pr = poll(pfds, (nfds_t) nf, 500);   /* 500ms tick → idle reap + stop check */
+        if (pr < 0 && errno == EINTR) continue;
+        time_t now = time(NULL);
+
+        if (pr > 0) {
+            /* Listener readable: drain queued client datagrams. */
+            if (pfds[0].revents & POLLIN) {
+                for (;;) {
+                    struct sockaddr_storage cli;
+                    socklen_t clen = sizeof(cli);
+                    ssize_t n = recvfrom(lfd, buf, (size_t) bsz, 0,
+                                         (struct sockaddr*) &cli, &clen);
+                    if (n < 0) break;            /* EAGAIN: listener drained */
+
+                    /* Existing session for this client? */
+                    int slot = -1;
+                    for (i = 0; i < cap; i++) {
+                        if (sess[i].in_use && amnetstream_udp_same_client(&sess[i], &cli, clen)) {
+                            slot = i; break;
+                        }
+                    }
+
+                    if (slot < 0) {
+                        /* New session — enforce caps (fail closed: drop). */
+                        char ipbuf[INET6_ADDRSTRLEN];
+                        amnetstream_udp_ip(&cli, ipbuf, sizeof(ipbuf));
+
+                        if (max_sessions > 0 && active >= (int) max_sessions) continue;
+                        if (max_per_ip > 0 && ipbuf[0]) {
+                            int c = 0, k;
+                            for (k = 0; k < cap; k++)
+                                if (sess[k].in_use &&
+                                    strncmp(sess[k].cli_ip, ipbuf, INET6_ADDRSTRLEN) == 0) c++;
+                            if (c >= (int) max_per_ip) continue;
+                        }
+                        int free_slot = -1, k;
+                        for (k = 0; k < cap; k++) if (!sess[k].in_use) { free_slot = k; break; }
+                        if (free_slot < 0) continue;   /* table full: drop */
+
+                        int ufd = (int) socket(up_family, up_socktype, up_proto);
+                        if (ufd < 0) continue;
+                        if (connect(ufd, (struct sockaddr*) &up_addr, up_len) < 0) { close(ufd); continue; }
+                        amnetstream_set_nonblock(ufd);
+
+                        sess[free_slot].in_use      = 1;
+                        sess[free_slot].up_fd       = ufd;
+                        memcpy(&sess[free_slot].cli, &cli, (size_t) clen);
+                        sess[free_slot].cli_len     = clen;
+                        strncpy(sess[free_slot].cli_ip, ipbuf, INET6_ADDRSTRLEN - 1);
+                        sess[free_slot].cli_ip[INET6_ADDRSTRLEN - 1] = '\0';
+                        sess[free_slot].last_active = now;
+                        active++;
+                        slot = free_slot;
+                    }
+
+                    /* Forward this datagram upstream (connected → send). */
+                    send(sess[slot].up_fd, buf, (size_t) n, 0);
+                    sess[slot].last_active = now;
+                }
+            }
+
+            /* Session sockets readable: relay upstream replies to client. */
+            int k;
+            for (k = 1; k < nf; k++) {
+                if (!(pfds[k].revents & POLLIN)) continue;
+                int s = pidx[k];
+                if (s < 0 || !sess[s].in_use) continue;
+                for (;;) {
+                    ssize_t n = recv(sess[s].up_fd, buf, (size_t) bsz, 0);
+                    if (n < 0) break;            /* EAGAIN: drained */
+                    sendto(lfd, buf, (size_t) n, 0,
+                           (struct sockaddr*) &sess[s].cli, sess[s].cli_len);
+                    sess[s].last_active = now;
+                }
+            }
+        }
+
+        /* Idle reap — the only way a UDP session ends (no FIN). */
+        if (idle_ms > 0) {
+            for (i = 0; i < cap; i++) {
+                if (sess[i].in_use && (long long)(now - sess[i].last_active) * 1000 >= idle_ms) {
+                    close(sess[i].up_fd);
+                    sess[i].in_use = 0;
+                    active--;
+                }
+            }
+        }
+    }
+
+    /* Graceful shutdown: drain accounting, close every session fd. */
+    for (i = 0; i < cap; i++) if (sess[i].in_use) close(sess[i].up_fd);
+    free(sess); free(buf); free(pfds); free(pidx);
+    amnetstream_listen_fd = -1;
+    close(lfd);
+    return 0;
+}
+
 #endif /* AMALGAME_NET_STREAM_H */
