@@ -1,9 +1,9 @@
 # amalgame-net-stream
 
 Raw **L4 TCP + UDP stream proxy** for the Amalgame / Mosaic stack — the
-nginx `stream {}` / HAProxy TCP+UDP-mode slice. Forward a local port to a
-fixed upstream `host:port` without parsing the payload: raw bytes both
-ways for TCP, datagrams both ways for UDP. Use it to front a database, a
+nginx `stream {}` / HAProxy TCP+UDP-mode slice. Forward a local port to
+one or more upstreams without parsing the payload: raw bytes both ways
+for TCP, datagrams both ways for UDP. Use it to front a database, a
 message broker, a DNS resolver, a game server, or any opaque protocol.
 
 ```amalgame
@@ -20,7 +20,19 @@ UdpProxy.New()
     .Listen(5300)
     .Forward("resolver.internal", 53)
     .Serve()
+
+// Load-balanced pool (round-robin default; ip_hash / least_conn too)
+TcpProxy.New()
+    .Listen(6432)
+    .Forward("db-a.internal", 5432)        // first upstream
+    .AddUpstream("db-b.internal", 5432)    // + more
+    .LeastConnections()                    // strategy
+    .Serve()
 ```
+
+The listener is **IPv6 dual-stack** (it accepts both IPv6 and
+IPv4-mapped clients) with an automatic IPv4 fallback where IPv6 is
+unavailable.
 
 ## Why a dedicated C splice (binary-safety)
 
@@ -88,6 +100,23 @@ UdpProxy.New() : UdpProxy
   .Serve() : int                  // blocks; 0 = clean shutdown, <0 = error
 ```
 
+### Load-balancing across a pool (both proxies)
+
+```amalgame
+  .Forward(host, port)            // sets / resets the pool to one upstream
+  .AddUpstream(host, port)        // append another upstream to the pool
+  .RoundRobin()                   // strategy: rotate (default)
+  .IpHash()                       // strategy: sticky per client IP
+  .LeastConnections()             // strategy: fewest in-flight (TCP conns /
+                                  //           UDP sessions)
+  .Strategy("round_robin" | "ip_hash" | "least_conn")   // by name
+```
+
+TCP dials with **failover**: if the chosen upstream won't connect, the
+remaining upstreams are tried before the connection is dropped. For UDP,
+the strategy picks an upstream per *session* and the client sticks to it
+for the session's lifetime (ip_hash is naturally sticky per client IP).
+
 ## End-to-end
 
 ```bash
@@ -105,16 +134,16 @@ NS_LISTEN=5300 NS_UPSTREAM_HOST=1.1.1.1 NS_UPSTREAM_PORT=53 ./udp_forward
 dig @127.0.0.1 -p 5300 example.com
 ```
 
-## Limitations (v0.2.0 — honest scope)
+## Limitations (v0.3.0 — honest scope)
 
-- **Single fixed upstream.** Load balancing across N upstreams (pools,
-  health checks, round-robin / least-conn) is the next target —
-  mirrors the `amalgame-net-proxy` v0.1 → v0.2 cadence. Applies to both
-  TCP and UDP.
-- **IPv4 listener.** The upstream dial already accepts IPv6; only the
-  *listen* side is IPv4 today. Dual-stack bind is tracked.
+- **No active health checks.** Load balancing is shipped (round-robin /
+  ip-hash / least-conn, TCP with dial failover), but there is no
+  background `/healthz` probe or outlier ejection yet — a dead upstream
+  is only skipped at TCP dial time (UDP, being connectionless, can't tell
+  a black-holing upstream from a quiet one). Tracked follow-up.
 - **No TLS at the edge.** TLS termination / origination (and DTLS for
-  UDP) is a later target (would compose `amalgame-tls`).
+  UDP) is the next target (would compose `amalgame-tls`).
+- **Up to 64 upstreams** per proxy (`AMNETSTREAM_MAX_UPSTREAMS`).
 - **TCP per-IP table is bounded** to 4096 distinct source IPs; once full,
   a new IP is admitted but not per-IP-tracked (the global cap still
   bounds total load). Documented, not silent.

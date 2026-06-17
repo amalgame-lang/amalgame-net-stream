@@ -39,19 +39,25 @@ public class Program {
         let lp: int    = Program.EnvInt("NS_LISTEN", 0)
         let uh: string = Program.EnvStr("NS_UPSTREAM_HOST", "")
         let up: int    = Program.EnvInt("NS_UPSTREAM_PORT", 0)
+        let uh2: string = Program.EnvStr("NS_UPSTREAM2_HOST", "")
+        let up2: int    = Program.EnvInt("NS_UPSTREAM2_PORT", 0)
+        let strat: string = Program.EnvStr("NS_STRATEGY", "")
         let maxS: int  = Program.EnvInt("NS_MAX_SESSIONS", 256)
         let maxIp: int = Program.EnvInt("NS_MAX_PER_IP", 32)
         let idle: int  = Program.EnvInt("NS_IDLE_MS", 3000)
 
         Console.WriteLine("udp_forward: :" + String_FromInt(lp) + " -> " + uh + ":" + String_FromInt(up) + " (udp)")
 
-        let rc: int = UdpProxy.New()
-            .Listen(lp)
-            .Forward(uh, up)
-            .IdleTimeout(idle)        // idle session reap (mandatory for UDP)
-            .MaxConnections(maxS)
-            .MaxPerIp(maxIp)
-            .Serve()
+        let p: UdpProxy = UdpProxy.New()
+        p.Listen(lp)
+        p.Forward(uh, up)
+        p.IdleTimeout(idle)        // idle session reap (mandatory for UDP)
+        p.MaxConnections(maxS)
+        p.MaxPerIp(maxIp)
+        if (String_Length(uh2) > 0) { p.AddUpstream(uh2, up2) }
+        if (String_Length(strat) > 0) { p.Strategy(strat) }
+
+        let rc: int = p.Serve()
 
         Console.WriteLine("udp_forward: exited rc=" + String_FromInt(rc))
     }
